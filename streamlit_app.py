@@ -20,6 +20,8 @@ from hubspot_client import (
     get_email_statistics,
     get_email_statistics_intervals,
     get_recent_email_engagements,
+    resolve_contact_names,
+    resolve_file_names,
     summarize_engagements,
 )
 
@@ -186,15 +188,16 @@ with tab_docs:
     st.subheader("Documents attached to emails")
     st.info(
         "**Note:** HubSpot's public API exposes *which* documents were attached to "
-        "emails (via engagement attachments), but does not expose per-page "
-        "time-spent data. For time-spent metrics, use the Sales Content Analytics "
-        "UI export, or a third-party tool like CloudFiles.",
+        "emails and *who* received them (with open status), but does **not** expose "
+        "per-page time-spent data. For time-spent metrics, use the Sales Content "
+        "Analytics UI export or a tool like CloudFiles.",
         icon="ℹ️",
     )
 
     if not engagements:
         st.write("No engagements loaded — check the Engagement tab.")
     else:
+        # Build a flat list of (engagement, attachment) rows
         doc_rows = []
         for item in engagements:
             attachments = item.get("attachments") or []
@@ -202,38 +205,140 @@ with tab_docs:
                 continue
             eng = item.get("engagement", {})
             meta = item.get("metadata", {})
+            assoc = item.get("associations", {}) or {}
+            contact_ids = assoc.get("contactIds", []) or []
             for att in attachments:
                 doc_rows.append(
                     {
                         "engagementId": eng.get("id"),
                         "createdAt": pd.to_datetime(eng.get("createdAt"), unit="ms"),
                         "subject": meta.get("subject"),
-                        "attachmentId": att.get("id"),
+                        "attachmentId": str(att.get("id")),
                         "openCount": meta.get("openCount", 0),
+                        "replyCount": meta.get("replyCount", 0),
+                        "status": meta.get("emailStatus"),
+                        "contactIds": contact_ids,
                     }
                 )
 
-        if doc_rows:
+        if not doc_rows:
+            st.write("No email engagements with attachments in this window.")
+        else:
             df_docs = pd.DataFrame(doc_rows)
-            top = (
-                df_docs.groupby("attachmentId")
+
+            # Resolve attachment IDs → friendly names
+            with st.spinner("Resolving document names..."):
+                name_map = resolve_file_names(
+                    token, df_docs["attachmentId"].unique().tolist()
+                )
+            df_docs["document"] = df_docs["attachmentId"].map(
+                lambda x: name_map.get(x, f"Document {x}")
+            )
+
+            # Filter dropdown
+            doc_options = sorted(df_docs["document"].unique().tolist())
+            selected_docs = st.multiselect(
+                "Filter by document",
+                options=doc_options,
+                default=doc_options,
+                help=(
+                    "Pick one or more documents to focus on. The recipient list "
+                    "below updates to show who received and who opened the email "
+                    "carrying that document."
+                ),
+            )
+
+            df_filtered = df_docs[df_docs["document"].isin(selected_docs)]
+
+            # KPIs for the selected docs
+            unique_docs = df_filtered["document"].nunique()
+            total_sends = len(df_filtered)
+            total_opens = int(df_filtered["openCount"].sum())
+            unique_recipients = len(
+                {cid for cids in df_filtered["contactIds"] for cid in cids}
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Documents", unique_docs)
+            c2.metric("Email sends", total_sends)
+            c3.metric("Total opens", total_opens)
+            c4.metric("Unique recipients", unique_recipients)
+
+            # Per-document rollup
+            st.markdown("**Per-document summary**")
+            rollup = (
+                df_filtered.groupby("document")
                 .agg(
                     times_sent=("engagementId", "count"),
                     total_opens=("openCount", "sum"),
+                    unique_recipients=(
+                        "contactIds",
+                        lambda s: len({c for cids in s for c in cids}),
+                    ),
                 )
                 .reset_index()
                 .sort_values("times_sent", ascending=False)
             )
-            st.markdown("**Most-sent attachments**")
-            st.dataframe(top, use_container_width=True, hide_index=True)
-            st.markdown("**Recent sends**")
-            st.dataframe(
-                df_docs.sort_values("createdAt", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.write("No email engagements with attachments in this window.")
+            st.dataframe(rollup, use_container_width=True, hide_index=True)
+
+            # Recipient detail — only worth the API calls if a focused set is selected
+            st.markdown("**Recipients who received the selected documents**")
+            if len(selected_docs) == 0:
+                st.caption("Pick at least one document above.")
+            else:
+                # Flatten contact IDs along with whether the email was opened
+                recipient_rows = []
+                for _, row in df_filtered.iterrows():
+                    opened = row["openCount"] > 0
+                    for cid in row["contactIds"]:
+                        recipient_rows.append(
+                            {
+                                "contactId": str(cid),
+                                "document": row["document"],
+                                "sentAt": row["createdAt"],
+                                "subject": row["subject"],
+                                "opened": opened,
+                            }
+                        )
+
+                if not recipient_rows:
+                    st.caption(
+                        "No contact associations found on these engagements. "
+                        "(HubSpot sometimes returns engagements without contact IDs "
+                        "if the email was logged via BCC drop-address.)"
+                    )
+                else:
+                    df_recip = pd.DataFrame(recipient_rows)
+                    with st.spinner("Resolving recipient names..."):
+                        contact_map = resolve_contact_names(
+                            token, df_recip["contactId"].unique().tolist()
+                        )
+                    df_recip["name"] = df_recip["contactId"].map(
+                        lambda c: contact_map.get(c, {}).get("name", f"Contact {c}")
+                    )
+                    df_recip["email"] = df_recip["contactId"].map(
+                        lambda c: contact_map.get(c, {}).get("email", "")
+                    )
+
+                    # Toggle: all recipients vs only those who opened
+                    only_opened = st.checkbox(
+                        "Show only recipients who opened", value=False
+                    )
+                    df_show = df_recip[df_recip["opened"]] if only_opened else df_recip
+
+                    st.dataframe(
+                        df_show[
+                            ["name", "email", "document", "subject", "sentAt", "opened"]
+                        ].sort_values(["document", "sentAt"], ascending=[True, False]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.caption(
+                        "⚠️ 'Opened' here means the email carrying the document was "
+                        "opened — it doesn't strictly prove the recipient viewed the "
+                        "document itself."
+                    )
 
 st.divider()
 st.caption(
