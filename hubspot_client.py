@@ -10,6 +10,7 @@ Required private app scopes:
   - marketing-email
   - crm.objects.contacts.read
   - sales-email-read
+  - files                       (to resolve document names)
 """
 from __future__ import annotations
 
@@ -191,3 +192,77 @@ def default_window(days: int = 30) -> tuple[datetime, datetime]:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     return start, end
+
+
+# ---------------------------------------------------------------------------
+# Files (resolve attachment IDs to friendly names)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_file_info(token: str, file_id: str) -> dict[str, Any]:
+    """
+    Look up a file by ID. Returns {} on 404/403 so the dashboard can fall
+    back to displaying the raw ID.
+
+    Endpoint: GET /files/v3/files/{fileId}
+    Requires the 'files' scope on the private app.
+    """
+    try:
+        return _request("GET", f"/files/v3/files/{file_id}", token)
+    except HubSpotError:
+        return {}
+
+
+def resolve_file_names(token: str, file_ids: list[str]) -> dict[str, str]:
+    """
+    Bulk-resolve a list of file IDs to a {id: name} map. Cached per-ID
+    so repeated lookups across reruns are free.
+    """
+    out: dict[str, str] = {}
+    for fid in set(file_ids):
+        if not fid:
+            continue
+        info = get_file_info(token, str(fid))
+        name = info.get("name") or info.get("path")
+        out[str(fid)] = name or f"Document {fid}"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Contacts (resolve contact IDs to names/emails for the recipients view)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_contact_info(token: str, contact_id: str) -> dict[str, Any]:
+    """
+    Look up a contact by ID, returning firstname, lastname, email.
+
+    Endpoint: GET /crm/v3/objects/contacts/{id}
+    """
+    try:
+        return _request(
+            "GET",
+            f"/crm/v3/objects/contacts/{contact_id}",
+            token,
+            params={"properties": "firstname,lastname,email"},
+        )
+    except HubSpotError:
+        return {}
+
+
+def resolve_contact_names(
+    token: str, contact_ids: list[int | str]
+) -> dict[str, dict[str, str]]:
+    """
+    Bulk-resolve contact IDs to {id: {name, email}}.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for cid in set(str(c) for c in contact_ids if c):
+        info = get_contact_info(token, cid)
+        props = info.get("properties", {}) or {}
+        first = props.get("firstname") or ""
+        last = props.get("lastname") or ""
+        name = (f"{first} {last}").strip() or props.get("email") or f"Contact {cid}"
+        out[cid] = {
+            "name": name,
+            "email": props.get("email") or "",
+        }
+    return out
