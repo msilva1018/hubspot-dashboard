@@ -185,13 +185,9 @@ with tab_engagement:
 
 # ---- Documents -------------------------------------------------------------
 with tab_docs:
-    st.subheader("Documents attached to emails")
-    st.info(
-        "**Note:** HubSpot's public API exposes *which* documents were attached to "
-        "emails and *who* received them (with open status), but does **not** expose "
-        "per-page time-spent data. For time-spent metrics, use the Sales Content "
-        "Analytics UI export or a tool like CloudFiles.",
-        icon="ℹ️",
+    st.subheader("Document viewers")
+    st.caption(
+        "Pick a document below to see who opened the email it was attached to."
     )
 
     if not engagements:
@@ -215,8 +211,6 @@ with tab_docs:
                         "subject": meta.get("subject"),
                         "attachmentId": str(att.get("id")),
                         "openCount": meta.get("openCount", 0),
-                        "replyCount": meta.get("replyCount", 0),
-                        "status": meta.get("emailStatus"),
                         "contactIds": contact_ids,
                     }
                 )
@@ -226,119 +220,109 @@ with tab_docs:
         else:
             df_docs = pd.DataFrame(doc_rows)
 
-            # Resolve attachment IDs → friendly names
-            with st.spinner("Resolving document names..."):
+            # Resolve attachment IDs → friendly names (requires `files` scope)
+            with st.spinner("Loading document names..."):
                 name_map = resolve_file_names(
                     token, df_docs["attachmentId"].unique().tolist()
                 )
-            df_docs["document"] = df_docs["attachmentId"].map(
-                lambda x: name_map.get(x, f"Document {x}")
-            )
 
-            # Filter dropdown
-            doc_options = sorted(df_docs["document"].unique().tolist())
-            selected_docs = st.multiselect(
-                "Filter by document",
-                options=doc_options,
-                default=doc_options,
-                help=(
-                    "Pick one or more documents to focus on. The recipient list "
-                    "below updates to show who received and who opened the email "
-                    "carrying that document."
-                ),
-            )
-
-            df_filtered = df_docs[df_docs["document"].isin(selected_docs)]
-
-            # KPIs for the selected docs
-            unique_docs = df_filtered["document"].nunique()
-            total_sends = len(df_filtered)
-            total_opens = int(df_filtered["openCount"].sum())
-            unique_recipients = len(
-                {cid for cids in df_filtered["contactIds"] for cid in cids}
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Documents", unique_docs)
-            c2.metric("Email sends", total_sends)
-            c3.metric("Total opens", total_opens)
-            c4.metric("Unique recipients", unique_recipients)
-
-            # Per-document rollup
-            st.markdown("**Per-document summary**")
-            rollup = (
-                df_filtered.groupby("document")
-                .agg(
-                    times_sent=("engagementId", "count"),
-                    total_opens=("openCount", "sum"),
-                    unique_recipients=(
-                        "contactIds",
-                        lambda s: len({c for cids in s for c in cids}),
-                    ),
+            # Only keep rows where we successfully resolved a real name.
+            # If name_map returned the "Document {id}" fallback, the `files`
+            # scope is probably missing — warn the user explicitly.
+            df_docs["document"] = df_docs["attachmentId"].map(name_map)
+            unresolved = df_docs["document"].str.startswith("Document ", na=False)
+            if unresolved.all():
+                st.error(
+                    "Couldn't resolve any document names. This usually means the "
+                    "`files` scope is missing from your private app. Add it under "
+                    "Settings → Integrations → Private Apps → your app → Scopes.",
+                    icon="⚠️",
                 )
-                .reset_index()
-                .sort_values("times_sent", ascending=False)
+                st.stop()
+            elif unresolved.any():
+                st.warning(
+                    f"{unresolved.sum()} attachment(s) couldn't be resolved to "
+                    "names (possibly deleted from the file manager). They're "
+                    "hidden from the dropdown.",
+                    icon="ℹ️",
+                )
+                df_docs = df_docs[~unresolved]
+
+            # Dropdown: single document, names only
+            doc_names = sorted(df_docs["document"].unique().tolist())
+            selected_doc = st.selectbox(
+                "Document",
+                options=doc_names,
+                index=0 if doc_names else None,
+                placeholder="Choose a document…",
             )
-            st.dataframe(rollup, use_container_width=True, hide_index=True)
 
-            # Recipient detail — only worth the API calls if a focused set is selected
-            st.markdown("**Recipients who received the selected documents**")
-            if len(selected_docs) == 0:
-                st.caption("Pick at least one document above.")
+            df_filtered = df_docs[df_docs["document"] == selected_doc]
+
+            # Headline metrics for this doc
+            total_sends = len(df_filtered)
+            df_viewed = df_filtered[df_filtered["openCount"] > 0]
+            unique_viewers = len(
+                {cid for cids in df_viewed["contactIds"] for cid in cids}
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Times sent", total_sends)
+            c2.metric("Times opened", int(df_filtered["openCount"].sum()))
+            c3.metric("Unique viewers", unique_viewers)
+
+            # Viewer list — only contacts whose email was actually opened
+            st.markdown(f"**People who opened an email containing _{selected_doc}_**")
+
+            viewer_rows = []
+            for _, row in df_viewed.iterrows():
+                for cid in row["contactIds"]:
+                    viewer_rows.append(
+                        {
+                            "contactId": str(cid),
+                            "sentAt": row["createdAt"],
+                            "subject": row["subject"],
+                        }
+                    )
+
+            if not viewer_rows:
+                st.info(
+                    "No opens recorded for this document yet.",
+                    icon="📭",
+                )
             else:
-                # Flatten contact IDs along with whether the email was opened
-                recipient_rows = []
-                for _, row in df_filtered.iterrows():
-                    opened = row["openCount"] > 0
-                    for cid in row["contactIds"]:
-                        recipient_rows.append(
-                            {
-                                "contactId": str(cid),
-                                "document": row["document"],
-                                "sentAt": row["createdAt"],
-                                "subject": row["subject"],
-                                "opened": opened,
-                            }
-                        )
+                df_viewers = pd.DataFrame(viewer_rows)
+                with st.spinner("Loading viewer names…"):
+                    contact_map = resolve_contact_names(
+                        token, df_viewers["contactId"].unique().tolist()
+                    )
+                df_viewers["name"] = df_viewers["contactId"].map(
+                    lambda c: contact_map.get(c, {}).get("name", "")
+                )
+                df_viewers["email"] = df_viewers["contactId"].map(
+                    lambda c: contact_map.get(c, {}).get("email", "")
+                )
 
-                if not recipient_rows:
-                    st.caption(
-                        "No contact associations found on these engagements. "
-                        "(HubSpot sometimes returns engagements without contact IDs "
-                        "if the email was logged via BCC drop-address.)"
+                # One row per viewer, with their most recent open
+                df_unique = (
+                    df_viewers.sort_values("sentAt", ascending=False)
+                    .drop_duplicates(subset=["contactId"])
+                    .loc[:, ["name", "email", "sentAt", "subject"]]
+                    .rename(
+                        columns={
+                            "sentAt": "Last opened",
+                            "subject": "Email subject",
+                        }
                     )
-                else:
-                    df_recip = pd.DataFrame(recipient_rows)
-                    with st.spinner("Resolving recipient names..."):
-                        contact_map = resolve_contact_names(
-                            token, df_recip["contactId"].unique().tolist()
-                        )
-                    df_recip["name"] = df_recip["contactId"].map(
-                        lambda c: contact_map.get(c, {}).get("name", f"Contact {c}")
-                    )
-                    df_recip["email"] = df_recip["contactId"].map(
-                        lambda c: contact_map.get(c, {}).get("email", "")
-                    )
+                )
+                st.dataframe(df_unique, use_container_width=True, hide_index=True)
 
-                    # Toggle: all recipients vs only those who opened
-                    only_opened = st.checkbox(
-                        "Show only recipients who opened", value=False
-                    )
-                    df_show = df_recip[df_recip["opened"]] if only_opened else df_recip
-
-                    st.dataframe(
-                        df_show[
-                            ["name", "email", "document", "subject", "sentAt", "opened"]
-                        ].sort_values(["document", "sentAt"], ascending=[True, False]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    st.caption(
-                        "⚠️ 'Opened' here means the email carrying the document was "
-                        "opened — it doesn't strictly prove the recipient viewed the "
-                        "document itself."
-                    )
+                st.caption(
+                    "Note: 'opened' reflects an email open, not strictly a "
+                    "document view. For true document-view + time-spent data, "
+                    "the HubSpot UI's Sales Content Analytics or a tool like "
+                    "CloudFiles is needed."
+                )
 
 st.divider()
 st.caption(
